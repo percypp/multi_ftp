@@ -223,3 +223,131 @@ def multi_ftp_transfer(
     except Exception as e:
         logger.error(f"傳輸過程中發生錯誤: {e}")
         return False
+
+20241107
+def multi_ftp_transfer(
+    file_path: str,
+    ftp_hosts: List[Tuple[str, int]],
+    username: str,
+    password: str,
+    max_retries: int = 3,
+    retry_delay: float = 1.0
+) -> bool:
+    """使用FTP的REST命令進行分段上傳"""
+    try:
+        file_size = os.path.getsize(file_path)
+        part_size = file_size // len(ftp_hosts)
+        
+        task_queue: Queue = Queue()
+        
+        for i, (host, port) in enumerate(ftp_hosts):
+            start_pos = i * part_size
+            end_pos = file_size if i == len(ftp_hosts) - 1 else (i + 1) * part_size
+            task_queue.put((host, port, start_pos, end_pos, 0))
+            
+        def ftp_upload(task_queue: Queue) -> None:
+            while True:
+                try:
+                    host, port, start_pos, end_pos, retry_count = task_queue.get_nowait()
+                except Queue.Empty:
+                    break
+                    
+                try:
+                    with ftp_connection(host, port, username, password) as ftp:
+                        with open(file_path, 'rb') as f:
+                            f.seek(start_pos)
+                            ftp.voidcmd(f"REST {start_pos}")
+                            ftp.storbinary(f'STOR {os.path.basename(file_path)}', f, rest=start_pos)
+                        logger.info(f"成功上傳: {file_path} 的部分 {start_pos}-{end_pos} 到 {host}:{port}")
+                        
+                except (error_perm, error_temp, ConnectionError, TimeoutError) as e:
+                    logger.error(f"上傳失敗: {file_path} 的部分 {start_pos}-{end_pos} 到 {host}:{port}, 錯誤: {str(e)}")
+                    if retry_count < max_retries:
+                        task_queue.put((host, port, start_pos, end_pos, retry_count + 1))
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"已達最大重試次數,放棄上傳: {file_path} 的部分 {start_pos}-{end_pos}")
+                finally:
+                    task_queue.task_done()
+        
+        threads = []
+        for _ in range(len(ftp_hosts)):
+            thread = threading.Thread(target=ftp_upload, args=(task_queue,))
+            thread.daemon = True
+            threads.append(thread)
+            thread.start()
+            
+        task_queue.join()
+        return True
+        
+    except Exception as e:
+        logger.error(f"傳輸過程中發生錯誤: {e}")
+        return False
+
+def multi_ftp_transfer(
+    file_path: str,
+    ftp_hosts: List[Tuple[str, int]],
+    username: str,
+    password: str,
+    max_retries: int = 3,
+    retry_delay: float = 1.0
+) -> bool:
+    """使用FTP的REST命令進行分段上傳"""
+    try:
+        file_size = os.path.getsize(file_path)
+        part_size = file_size // len(ftp_hosts)
+        
+        task_queue = Queue()
+        
+        for i, (host, port) in enumerate(ftp_hosts):
+            start_pos = i * part_size
+            end_pos = file_size if i == len(ftp_hosts) - 1 else (i + 1) * part_size
+            task_queue.put((host, port, start_pos, end_pos, 0))
+            
+        def ftp_upload(task_queue):
+            while True:
+                try:
+                    host, port, start_pos, end_pos, retry_count = task_queue.get_nowait()
+                except Queue.Empty:
+                    break
+                    
+                try:
+                    with ftp_connection(host, port, username, password) as ftp:
+                        with open(file_path, 'rb') as f:
+                            f.seek(start_pos)
+                            ftp.voidcmd(f"REST {start_pos}")
+                            
+                            bytes_remaining = end_pos - start_pos
+                            while bytes_remaining > 0:
+                                chunk_size = min(1024, bytes_remaining)
+                                data = f.read(chunk_size)
+                                if not data:
+                                    break
+                                ftp.storbinary(f'STOR {os.path.basename(file_path)}', data)
+                                bytes_remaining -= len(data)
+                            
+                        logger.info(f"成功上傳: {file_path} 的部分 {start_pos}-{end_pos} 到 {host}:{port}")
+                        
+                except (error_perm, error_temp, ConnectionError, TimeoutError) as e:
+                    logger.error(f"上傳失敗: {file_path} 的部分 {start_pos}-{end_pos} 到 {host}:{port}, 錯誤: {str(e)}")
+                    if retry_count < max_retries:
+                        task_queue.put((host, port, start_pos, end_pos, retry_count + 1))
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"已達最大重試次數,放棄上傳: {file_path} 的部分 {start_pos}-{end_pos}")
+                finally:
+                    task_queue.task_done()
+        
+        threads = []
+        for _ in range(len(ftp_hosts)):
+            thread = threading.Thread(target=ftp_upload, args=(task_queue,))
+            thread.daemon = True
+            threads.append(thread)
+            thread.start()
+            
+        task_queue.join()
+        return True
+        
+    except Exception as e:
+        logger.error(f"傳輸過程中發生錯誤: {e}")
+        return False
