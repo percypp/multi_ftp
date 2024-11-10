@@ -2,7 +2,6 @@ import io
 import os
 import time
 import threading
-import queue
 import logging
 from ftplib import FTP, error_perm, error_temp, ConnectionError, TimeoutError
 from queue import Queue
