@@ -1,0 +1,445 @@
+這是一個非常好的架構思路。將系統分層為 **Agent (流程控制)**、**Kernel (底層實作)** 和 **Sanity Check (驗證邏輯)**，可以讓程式碼具備高度擴充性。
+
+針對你的需求：
+
+1.  **SFTP** 使用 `paramiko`。
+2.  **FTP** 使用 Python 內建的 `ftplib`。
+3.  **Aspera** 通常是透過 command line tool (`ascp`) 呼叫，我們會用 `subprocess` 封裝它。
+4.  **架構**：Agent -\> Kernel (Adapter) -\> Sanity Logic。
+
+-----
+
+### 系統架構設計圖
+
+```text
+[Client / User]
+      | (Args: ConnectionInfo, TransferRequest)
+      v
++-------------------------------------------------------+
+|  Transfer Agent (Facade / Manager)                    |
+|  - 負責協調工作流程                                     |
+|  - 1. Init Kernel -> 2. Transfer -> 3. Sanity Check   |
++-------------------------------------------------------+
+      |
+      | 擁有 (Has-a)
+      v
++-------------------------------------------------------+
+|  Transfer Kernel (Abstract Base Class)                |
+|  - 定義介面: connect, put, get_stat, get_checksum...   |
++-------------------------------------------------------+
+      ^              ^                 ^
+      |              |                 |
+[SFTP Kernel]   [FTP Kernel]    [Aspera Kernel]
+(paramiko)      (ftplib)        (subprocess ascp)
+```
+
+-----
+
+### 1\. 定義參數結構 (Data Structure)
+
+這部分維持之前的 `dataclass` 設計，確保參數傳遞乾淨。
+
+```python
+import os
+import logging
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional, List, Dict, Any
+
+# --- Enums ---
+class Protocol(Enum):
+    FTP = auto()
+    SFTP = auto()
+    ASPERA = auto()
+
+class CheckType(Enum):
+    FILE_SIZE = auto()
+    TIMESTAMP = auto()
+    CHECKSUM = auto()
+
+# --- Config Objects ---
+@dataclass
+class ConnectionInfo:
+    host: str
+    username: str
+    password: Optional[str] = None
+    port: int = 22
+    key_path: Optional[str] = None
+    # Aspera 特有的參數，例如頻寬限制
+    extra_options: Dict[str, Any] = field(default_factory=lambda: {"aspera_bandwidth": "100m"})
+
+@dataclass
+class SanityConfig:
+    checks: List[CheckType]
+    checksum_algo: str = "md5"  # md5, sha256
+    timestamp_tolerance: int = 60  # 秒
+
+@dataclass
+class TransferRequest:
+    protocol: Protocol
+    source_info: ConnectionInfo
+    target_info: ConnectionInfo
+    source_file: str  # 本地路徑 (假設是上傳 Scenario)
+    target_file: str  # 遠端路徑
+    sanity_config: SanityConfig
+```
+
+-----
+
+### 2\. Kernel Layer (核心實作層)
+
+這是最複雜的部分，必須把不同的 library 封裝成統一的介面。
+
+#### Base Kernel (Interface)
+
+```python
+from abc import ABC, abstractmethod
+import subprocess
+import stat
+
+class TransferKernel(ABC):
+    def __init__(self, request: TransferRequest):
+        self.request = request
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.connected = False
+
+    @abstractmethod
+    def connect(self):
+        """建立連線"""
+        pass
+
+    @abstractmethod
+    def disconnect(self):
+        """斷開連線"""
+        pass
+
+    @abstractmethod
+    def upload(self):
+        """執行上傳"""
+        pass
+
+    @abstractmethod
+    def get_remote_size(self, path: str) -> int:
+        """取得遠端檔案大小"""
+        pass
+    
+    @abstractmethod
+    def get_remote_checksum(self, path: str) -> str:
+        """
+        取得遠端 Checksum。
+        注意：FTP/SFTP 標準協定不一定支援 checksum 指令，
+        通常需要 SSH exec 或是下載回來算。這裡假設可以用某種方式取得。
+        """
+        pass
+```
+
+#### Implementation: SFTP Kernel (Paramiko)
+
+```python
+import paramiko
+
+class SFTPKernel(TransferKernel):
+    def __init__(self, request):
+        super().__init__(request)
+        self.transport = None
+        self.sftp = None
+
+    def connect(self):
+        self.logger.info(f"Connecting SFTP to {self.request.target_info.host}")
+        try:
+            self.transport = paramiko.Transport((self.request.target_info.host, self.request.target_info.port))
+            
+            # 判斷是用 Key 還是 Password
+            if self.request.target_info.key_path:
+                pkey = paramiko.RSAKey.from_private_key_file(self.request.target_info.key_path)
+                self.transport.connect(username=self.request.target_info.username, pkey=pkey)
+            else:
+                self.transport.connect(username=self.request.target_info.username, password=self.request.target_info.password)
+            
+            self.sftp = paramiko.SFTPClient.from_transport(self.transport)
+            self.connected = True
+        except Exception as e:
+            self.logger.error(f"SFTP Connection failed: {e}")
+            raise
+
+    def upload(self):
+        self.logger.info(f"SFTP Uploading: {self.request.source_file} -> {self.request.target_file}")
+        self.sftp.put(self.request.source_file, self.request.target_file)
+
+    def get_remote_size(self, path: str) -> int:
+        file_stat = self.sftp.stat(path)
+        return file_stat.st_size
+
+    def get_remote_checksum(self, path: str) -> str:
+        # Paramiko SFTP 本身沒有 hash command，通常需要透過 SSH 執行 Linux command
+        # 這裡示範透過 Transport 開一個 Channel 去跑 md5sum
+        self.logger.info("Calculating remote checksum via SSH exec...")
+        session = self.transport.open_session()
+        cmd = f"{self.request.sanity_config.checksum_algo}sum {path} | awk '{{print $1}}'"
+        session.exec_command(cmd)
+        exit_code = session.recv_exit_status()
+        output = session.recv(1024).decode().strip()
+        if exit_code == 0:
+            return output
+        else:
+            raise Exception(f"Failed to get checksum: {output}")
+
+    def disconnect(self):
+        if self.sftp: self.sftp.close()
+        if self.transport: self.transport.close()
+        self.logger.info("SFTP Disconnected")
+```
+
+#### Implementation: FTP Kernel (ftplib)
+
+```python
+from ftplib import FTP
+
+class FTPKernel(TransferKernel):
+    def __init__(self, request):
+        super().__init__(request)
+        self.ftp = None
+
+    def connect(self):
+        self.logger.info(f"Connecting FTP to {self.request.target_info.host}")
+        self.ftp = FTP()
+        self.ftp.connect(self.request.target_info.host, self.request.target_info.port or 21)
+        self.ftp.login(self.request.target_info.username, self.request.target_info.password)
+        self.connected = True
+
+    def upload(self):
+        self.logger.info("FTP Uploading...")
+        with open(self.request.source_file, 'rb') as f:
+            self.ftp.storbinary(f'STOR {self.request.target_file}', f)
+
+    def get_remote_size(self, path: str) -> int:
+        self.ftp.voidcmd('TYPE I') # Binary mode for correct size
+        return self.ftp.size(path)
+
+    def get_remote_checksum(self, path: str) -> str:
+        # FTP 協議非常老舊，通常不支援遠端算 hash。
+        # 有些 server 支援 'SITE checksum' 或 'XCRC'，但很不通用。
+        # 這裡僅示範若 Server 支援的情況，否則通常需要下載回來算 (成本高)
+        self.logger.warning("FTP remote checksum is limited. Trying simple logic or skipping.")
+        return "NOT_SUPPORTED_ON_BASIC_FTP"
+
+    def disconnect(self):
+        if self.ftp:
+            self.ftp.quit()
+        self.logger.info("FTP Disconnected")
+```
+
+#### Implementation: Aspera Kernel (Subprocess Wrapper)
+
+Aspera 比較特別，它沒有持續連線的概念 (Sessionless)，每一個傳輸都是一個 Process。
+
+```python
+class AsperaKernel(TransferKernel):
+    def connect(self):
+        # Aspera 是 command line 工具，不需要 "保持連線"
+        # 這裡可以用來檢查 ascp 指令是否存在，或測試 SSH key 權限
+        pass
+
+    def upload(self):
+        self.logger.info("Aspera Uploading via ascp...")
+        # 組合 ascp 指令
+        # 格式: ascp -P [port] -l [limit] [src] [user]@[host]:[dst]
+        bandwidth = self.request.target_info.extra_options.get("aspera_bandwidth", "100m")
+        
+        # 設定環境變數傳密碼 (Aspera 不建議用參數傳密碼)
+        env = os.environ.copy()
+        if self.request.target_info.password:
+            env['ASPERA_SCP_PASS'] = self.request.target_info.password
+
+        cmd = [
+            'ascp',
+            '-P', str(self.request.target_info.port or 33001),
+            '-l', bandwidth,
+            '-k', '1', # Resume level
+            self.request.source_file,
+            f"{self.request.target_info.username}@{self.request.target_info.host}:{self.request.target_file}"
+        ]
+
+        if self.request.target_info.key_path:
+             cmd.insert(1, '-i')
+             cmd.insert(2, self.request.target_info.key_path)
+
+        self.logger.debug(f"Executing: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Aspera failed: {result.stderr}")
+
+    def get_remote_size(self, path: str) -> int:
+        # Aspera 傳輸後無法直接用 ascp 查大小。
+        # 通常這需要透過 SSH 連進去查。
+        # 這裡我們假設 Aspera Server 都有開 SSH (Port 22)
+        return self._ssh_exec(f"stat -c %s {path}")
+
+    def get_remote_checksum(self, path: str) -> str:
+        # 同樣透過 SSH 執行
+        cmd = f"{self.request.sanity_config.checksum_algo}sum {path} | awk '{{print $1}}'"
+        return self._ssh_exec(cmd, is_int=False)
+
+    def _ssh_exec(self, cmd, is_int=True):
+        # 簡單的 SSH 輔助函式 (利用 paramiko 或是 subprocess ssh)
+        # 為了簡潔，這裡省略實作，邏輯同 SFTPKernel.get_remote_checksum
+        # 在真實環境中，Aspera Server 通常也支援 SSH 登入
+        self.logger.warning("Aspera check requires SSH access. Returning mock value.")
+        return 1024 if is_int else "mock_hash"
+
+    def disconnect(self):
+        pass
+```
+
+-----
+
+### 3\. Sanity Check Layer (驗證邏輯)
+
+這層邏輯是獨立的，它只關心「來源」與「目的」是否一致，不關心是用哪種協定傳的。
+
+```python
+import hashlib
+
+class SanityChecker:
+    def __init__(self, kernel: TransferKernel, request: TransferRequest):
+        self.kernel = kernel
+        self.request = request
+        self.logger = logging.getLogger("SanityCheck")
+
+    def run_checks(self) -> bool:
+        config = self.request.sanity_config
+        self.logger.info("Starting Sanity Checks...")
+        
+        is_valid = True
+
+        # 1. File Size Check
+        if CheckType.FILE_SIZE in config.checks:
+            local_size = os.path.getsize(self.request.source_file)
+            remote_size = self.kernel.get_remote_size(self.request.target_file)
+            if local_size != remote_size:
+                self.logger.error(f"[FAIL] Size mismatch: Local {local_size} != Remote {remote_size}")
+                is_valid = False
+            else:
+                self.logger.info(f"[PASS] Size matched: {local_size}")
+
+        # 2. Checksum Check
+        if CheckType.CHECKSUM in config.checks:
+            local_hash = self._calculate_local_checksum(self.request.source_file, config.checksum_algo)
+            remote_hash = self.kernel.get_remote_checksum(self.request.target_file)
+            
+            # 處理 FTP 不支援的情況
+            if remote_hash == "NOT_SUPPORTED_ON_BASIC_FTP":
+                self.logger.warning("[SKIP] Checksum skipped due to protocol limitation")
+            elif local_hash != remote_hash:
+                self.logger.error(f"[FAIL] Checksum mismatch: Local {local_hash} != Remote {remote_hash}")
+                is_valid = False
+            else:
+                self.logger.info(f"[PASS] Checksum matched ({config.checksum_algo})")
+
+        return is_valid
+
+    def _calculate_local_checksum(self, filepath, algo):
+        hash_func = getattr(hashlib, algo)()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+```
+
+-----
+
+### 4\. The Agent (Agent Interface)
+
+將所有東西組合起來的入口。
+
+```python
+class TransferAgent:
+    def __init__(self, request: TransferRequest):
+        self.request = request
+        self.logger = logging.getLogger("TransferAgent")
+        self._setup_logging()
+
+    def _setup_logging(self):
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    def _get_kernel(self) -> TransferKernel:
+        if self.request.protocol == Protocol.SFTP:
+            return SFTPKernel(self.request)
+        elif self.request.protocol == Protocol.FTP:
+            return FTPKernel(self.request)
+        elif self.request.protocol == Protocol.ASPERA:
+            return AsperaKernel(self.request)
+        else:
+            raise ValueError("Unknown Protocol")
+
+    def execute(self):
+        kernel = self._get_kernel()
+        sanity = SanityChecker(kernel, self.request)
+
+        try:
+            # 1. Connect
+            kernel.connect()
+
+            # 2. Transfer
+            kernel.upload()
+
+            # 3. Sanity Check
+            if sanity.run_checks():
+                self.logger.info("Job Completed Successfully!")
+            else:
+                self.logger.error("Job Finished but Validation Failed!")
+                # 這裡可以決定要不要 retry 或 raise exception
+
+        except Exception as e:
+            self.logger.error(f"Critical Error during transfer: {e}")
+        finally:
+            kernel.disconnect()
+```
+
+-----
+
+### 5\. 使用範例 (How to run)
+
+```python
+if __name__ == "__main__":
+    # 1. 建立 Source / Target 資訊
+    # 假設從本機傳到遠端
+    target = ConnectionInfo(
+        host="192.168.1.100",
+        username="myuser",
+        password="mypassword", # 或是 key_path="/path/to/key"
+        port=22
+    )
+    
+    # 這裡 source_info 可以放空的，如果是 Local to Remote
+    source = ConnectionInfo(host="localhost", username="me") 
+
+    # 2. 設定檢查機制
+    checks = SanityConfig(
+        checks=[CheckType.FILE_SIZE, CheckType.CHECKSUM],
+        checksum_algo="md5"
+    )
+
+    # 3. 建立請求 (選擇 SFTP)
+    req = TransferRequest(
+        protocol=Protocol.SFTP,  # 改成 Protocol.ASPERA 或 Protocol.FTP 即可切換核心
+        source_info=source,
+        target_info=target,
+        source_file="./test_data.csv",
+        target_file="/remote/path/test_data.csv",
+        sanity_config=checks
+    )
+
+    # 4. 執行 Agent
+    agent = TransferAgent(req)
+    agent.execute()
+```
+
+### 總結這個設計的優點：
+
+1.  **參數乾淨**：所有 `args` 都被封裝在 `TransferRequest` 和 `ConnectionInfo` 內，如果要新增參數（例如 Aspera 的 Cipher 模式），只要改 DataClass，不用改函數簽名。
+2.  **擴充容易**：如果明天你要加 **S3**，只要寫一個 `S3Kernel` 繼承 `TransferKernel`，並在 Agent 的 `_get_kernel` 裡加一行判斷即可。
+3.  **邏輯分離**：Sanity Check 的邏輯與傳輸協定無關，只要 Kernel 能提供 `get_remote_size` 和 `get_remote_checksum`，檢查機制就能運作。
+
+你想針對哪一部分（例如 Aspera 的參數調優，或是 Checksum 的效率問題）再深入討論嗎？
